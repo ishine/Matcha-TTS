@@ -7,11 +7,11 @@ import torch
 import matcha.utils.monotonic_align as monotonic_align  # pylint: disable=consider-using-from-import
 from matcha import utils
 from matcha.models.baselightningmodule import BaseLightningClass
+from matcha.models.components.duration_predictors import DP
 from matcha.models.components.flow_matching import CFM
 from matcha.models.components.text_encoder import TextEncoder
 from matcha.utils.model import (
     denormalize,
-    duration_loss,
     fix_len_compatibility,
     generate_path,
     sequence_mask,
@@ -28,6 +28,7 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         spk_emb_dim,
         n_feats,
         encoder,
+        duration_predictor,
         decoder,
         cfm,
         data_statistics,
@@ -55,11 +56,12 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         self.encoder = TextEncoder(
             encoder.encoder_type,
             encoder.encoder_params,
-            encoder.duration_predictor_params,
             n_vocab,
             n_spks,
             spk_emb_dim,
         )
+
+        self.dp = DP(duration_predictor)
 
         self.decoder = CFM(
             in_channels=2 * encoder.encoder_params.n_feats,
@@ -73,7 +75,7 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         self.update_data_statistics(data_statistics)
 
     @torch.inference_mode()
-    def synthesise(self, x, x_lengths, n_timesteps, temperature=1.0, spks=None, length_scale=1.0):
+    def synthesise(self, x, x_lengths, n_timesteps, temperature=1.0, dp_temperature=0.5, spks=None, bert=None, length_scale=1.0):
         """
         Generates mel-spectrogram from text. Returns:
             1. encoder outputs
@@ -116,18 +118,29 @@ class MatchaTTS(BaseLightningClass):  # 🍵
             spks = self.spk_emb(spks.long())
 
         # Get encoder_outputs `mu_x` and log-scaled token durations `logw`
-        mu_x, logw, x_mask = self.encoder(x, x_lengths, spks)
+        mu_x, enc_output, x_mask = self.encoder(x, x_lengths, spks, bert)
 
-        w = torch.exp(logw) * x_mask
-        w_ceil = torch.ceil(w) * length_scale
-        y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+        # Get log-scaled token durations `logw`
+        logw = self.dp(enc_output, x_mask, dp_temperature)
+
+        w = torch.exp(logw) * x_mask * length_scale
+
+        w_round = torch.clamp_min(torch.round(w), 2)
+
+#        torch.set_printoptions(profile='full')
+#        torch.set_printoptions(linewidth=20000)
+#        from matcha.text import _id_to_symbol
+#        for i in range(x_lengths[0]):
+#             print (f"{_id_to_symbol[x[0,i].item()]} {w[0,0,i].item():.4f} {w_round[0, 0, i].item():.4f}")
+
+        y_lengths = torch.sum(w_round, [1, 2]).long()
         y_max_length = y_lengths.max()
         y_max_length_ = fix_len_compatibility(y_max_length)
 
         # Using obtained durations `w` construct alignment map `attn`
         y_mask = sequence_mask(y_lengths, y_max_length_).unsqueeze(1).to(x_mask.dtype)
         attn_mask = x_mask.unsqueeze(-1) * y_mask.unsqueeze(2)
-        attn = generate_path(w_ceil.squeeze(1), attn_mask.squeeze(1)).unsqueeze(1)
+        attn = generate_path(w_round.squeeze(1), attn_mask.squeeze(1)).unsqueeze(1)
 
         # Align encoded text and get mu_y
         mu_y = torch.matmul(attn.squeeze(1).transpose(1, 2), mu_x.transpose(1, 2))
@@ -150,7 +163,7 @@ class MatchaTTS(BaseLightningClass):  # 🍵
             "rtf": rtf,
         }
 
-    def forward(self, x, x_lengths, y, y_lengths, spks=None, out_size=None, cond=None, durations=None):
+    def forward(self, x, x_lengths, y, y_lengths, spks=None, bert=None, out_size=None, cond=None, durations=None):
         """
         Computes 3 losses:
             1. duration loss: loss between predicted token durations and those extracted by Monotonic Alignment Search (MAS).
@@ -176,7 +189,7 @@ class MatchaTTS(BaseLightningClass):  # 🍵
             spks = self.spk_emb(spks)
 
         # Get encoder_outputs `mu_x` and log-scaled token durations `logw`
-        mu_x, logw, x_mask = self.encoder(x, x_lengths, spks)
+        mu_x, enc_output, x_mask = self.encoder(x, x_lengths, spks, bert)
         y_max_length = y.shape[-1]
 
         y_mask = sequence_mask(y_lengths, y_max_length).unsqueeze(1).to(x_mask)
@@ -200,7 +213,7 @@ class MatchaTTS(BaseLightningClass):  # 🍵
         # Compute loss between predicted log-scaled durations and those obtained from MAS
         # refered to as prior loss in the paper
         logw_ = torch.log(1e-8 + torch.sum(attn.unsqueeze(1), -1)) * x_mask
-        dur_loss = duration_loss(logw, logw_, x_lengths)
+        dur_loss = self.dp.compute_loss(logw_, enc_output, x_mask)
 
         # Cut a small segment of mel-spectrogram in order to increase batch size
         #   - "Hack" taken from Grad-TTS, in case of Grad-TTS, we cannot train batch size 32 on a 24GB GPU without it

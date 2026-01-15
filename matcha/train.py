@@ -1,3 +1,7 @@
+import sys
+
+sys.path.insert(0, "/home/ubuntu/Matcha-TTS")
+
 from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
@@ -70,6 +74,13 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "trainer": trainer,
     }
 
+#    for param in model.encoder.parameters():
+#        param.requires_grad = False
+#    for param in model.decoder.parameters():
+#        param.requires_grad = False
+#    for param in model.dp.parameters():
+#        param.requires_grad = True
+
     if logger:
         log.info("Logging hyperparameters!")
         utils.log_hyperparameters(object_dict)
@@ -77,6 +88,7 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if cfg.get("train"):
         log.info("Starting training!")
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
+#        trainer.validate(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
 
     train_metrics = trainer.callback_metrics
 
